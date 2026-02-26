@@ -4,7 +4,7 @@ Manages PostgreSQL connections and provides schema initialization.
 """
 
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extras import RealDictCursor, Json, execute_values
 from pathlib import Path
 from config import DB_CONFIG
 
@@ -28,6 +28,7 @@ class DatabaseManager:
                 dbname=self.config["dbname"],
                 user=self.config["user"],
                 password=self.config["password"],
+                options="-c search_path=rag,public"
             )
             self.conn.autocommit = False
             logger.info(f"Connected to PostgreSQL at {self.config['host']}:{self.config['port']}/{self.config['dbname']}")
@@ -68,7 +69,7 @@ class DatabaseManager:
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO source_documents (file_name, file_path, file_type, file_hash, file_size_bytes, status)
+                    INSERT INTO rag.source_documents (file_name, file_path, file_type, file_hash, file_size_bytes, status)
                     VALUES (%s, %s, %s, %s, %s, 'processing')
                     ON CONFLICT (file_hash) DO NOTHING
                     RETURNING id
@@ -94,7 +95,7 @@ class DatabaseManager:
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE source_documents
+                    UPDATE rag.source_documents
                     SET status = %s,
                         total_chunks = COALESCE(%s, total_chunks),
                         error_message = %s,
@@ -114,7 +115,7 @@ class DatabaseManager:
         Batch insert chunks with their embeddings.
         
         Args:
-            source_id: ID from source_documents table
+            source_id: ID from rag.source_documents table
             chunks: list of dicts with keys: content, chunk_index, chunk_type, metadata
             embeddings: list of vectors (list of floats), same length as chunks
             embedding_model: string name of the model used
@@ -126,7 +127,7 @@ class DatabaseManager:
             with self.conn.cursor() as cur:
                 for chunk, embedding in zip(chunks, embeddings):
                     cur.execute("""
-                        INSERT INTO document_chunks 
+                        INSERT INTO rag.document_chunks 
                             (source_id, content, embedding, chunk_index, chunk_type, metadata, embedding_model)
                         VALUES (%s, %s, %s::vector, %s, %s, %s, %s)
                     """, (
@@ -146,6 +147,45 @@ class DatabaseManager:
             self.conn.rollback()
             logger.error(f"Failed to insert chunks for source {source_id}: {e}")
             raise
+        
+
+    def insert_chunks(self, source_id, chunks, embeddings, embedding_model):
+        """
+        Batch insert chunks using execute_values for high performance.
+        """
+        if len(chunks) != len(embeddings):
+            raise ValueError(f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings")
+
+        # Prepare the data as a list of tuples
+        data_tuples = [
+            (
+                source_id,
+                c["content"],
+                str(e),  # embedding vector
+                c["chunk_index"],
+                c.get("chunk_type", "text"),
+                Json(c.get("metadata", {})),
+                embedding_model
+            )
+            for c, e in zip(chunks, embeddings)
+        ]
+
+        sql = """
+            INSERT INTO rag.document_chunks 
+            (source_id, content, embedding, chunk_index, chunk_type, metadata, embedding_model)
+            VALUES %s
+        """
+
+        try:
+            with self.conn.cursor() as cur:
+                execute_values(cur, sql, data_tuples)
+            self.conn.commit()
+            logger.info(f"Batch inserted {len(chunks)} chunks for source_id={source_id}")
+
+        except psycopg2.Error as e:
+            self.conn.rollback()
+            logger.error(f"Failed to insert chunks: {e}")
+            raise  
 
     def search_similar(self, query_vector, top_k=5, embedding_model=None):
         """
@@ -178,8 +218,8 @@ class DatabaseManager:
                         sd.file_name AS source_file,
                         sd.file_type AS source_type,
                         1 - (dc.embedding <=> %s::vector) AS similarity
-                    FROM document_chunks dc
-                    JOIN source_documents sd ON sd.id = dc.source_id
+                    FROM rag.document_chunks dc
+                    JOIN rag.source_documents sd ON sd.id = dc.source_id
                     WHERE sd.status = 'completed'
                     {model_filter}
                     ORDER BY dc.embedding <=> %s::vector
@@ -209,7 +249,7 @@ class DatabaseManager:
         """Delete a source document and all its chunks (CASCADE)."""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("DELETE FROM source_documents WHERE id = %s RETURNING file_name", (source_id,))
+                cur.execute("DELETE FROM rag.source_documents WHERE id = %s RETURNING file_name", (source_id,))
                 result = cur.fetchone()
             self.conn.commit()
             if result:
@@ -225,8 +265,8 @@ class DatabaseManager:
         """Delete ALL data. Use with caution."""
         try:
             with self.conn.cursor() as cur:
-                cur.execute("DELETE FROM document_chunks")
-                cur.execute("DELETE FROM source_documents")
+                cur.execute("DELETE FROM rag.document_chunks")
+                cur.execute("DELETE FROM rag.source_documents")
             self.conn.commit()
             logger.warning("All data purged from vector database.")
         except psycopg2.Error as e:
@@ -239,11 +279,11 @@ class DatabaseManager:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT
-                        (SELECT COUNT(*) FROM source_documents) AS total_sources,
-                        (SELECT COUNT(*) FROM source_documents WHERE status = 'completed') AS completed_sources,
-                        (SELECT COUNT(*) FROM source_documents WHERE status = 'failed') AS failed_sources,
-                        (SELECT COUNT(*) FROM document_chunks) AS total_chunks,
-                        (SELECT COUNT(DISTINCT embedding_model) FROM document_chunks) AS embedding_models_used
+                        (SELECT COUNT(*) FROM rag.source_documents) AS total_sources,
+                        (SELECT COUNT(*) FROM rag.source_documents WHERE status = 'completed') AS completed_sources,
+                        (SELECT COUNT(*) FROM rag.source_documents WHERE status = 'failed') AS failed_sources,
+                        (SELECT COUNT(*) FROM rag.document_chunks) AS total_chunks,
+                        (SELECT COUNT(DISTINCT embedding_model) FROM rag.document_chunks) AS embedding_models_used
                 """)
                 return dict(cur.fetchone())
         except psycopg2.Error as e:

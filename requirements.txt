@@ -1,7 +1,7 @@
 # ─── Core ───
 python-dotenv>=1.0.0
 psycopg2-binary>=2.9.9
-
+nltk>=3.8.1
 # ─── Embedding Model ───
 sentence-transformers>=2.2.0
 torch>=2.0.0
