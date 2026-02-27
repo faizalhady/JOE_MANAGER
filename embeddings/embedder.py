@@ -4,6 +4,12 @@ Loads all-mpnet-base-v2 on GPU and provides text → vector conversion.
 This is the ONLY place in the codebase that touches the embedding model.
 """
 
+import os
+# Force Hugging Face and SentenceTransformers into 100% offline mode
+# This completely blocks the slow 10-second internet update checks.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import logging
 from typing import List
 from sentence_transformers import SentenceTransformer

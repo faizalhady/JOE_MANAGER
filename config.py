@@ -11,14 +11,24 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+# ─── Security Validation ───
+# Check if essential database credentials exist
+REQUIRED_DB_VARS = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+missing_vars = [var for var in REQUIRED_DB_VARS if not os.getenv(var)]
+
+if missing_vars:
+    print(f"CRITICAL ERROR: Missing database configuration in .env file.")
+    print(f"Missing variables: {', '.join(missing_vars)}")
+    print("Please check your .env file and connection string. The application cannot start.")
+    sys.exit(1)  # Immediately stop the program with an error code
 
 # ─── Database ───
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": int(os.getenv("DB_PORT", "5432")),
-    "dbname": os.getenv("DB_NAME", "joe"),
-    "user": os.getenv("DB_USER", "joe_pg"),
-    "password": os.getenv("DB_PASSWORD", "joe123"),
+    "host": os.getenv("DB_HOST"),
+    "port": int(os.getenv("DB_PORT")),
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
 }
 
 # ─── Embedding Model ───
