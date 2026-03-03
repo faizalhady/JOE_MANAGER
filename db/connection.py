@@ -112,7 +112,7 @@ class DatabaseManager:
 
     def insert_chunks(self, source_id, chunks, embeddings, embedding_model):
         """
-        Batch insert chunks with their embeddings.
+        Batch insert chunks using execute_values for high performance.
         
         Args:
             source_id: ID from rag.source_documents table
@@ -123,45 +123,11 @@ class DatabaseManager:
         if len(chunks) != len(embeddings):
             raise ValueError(f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings")
 
-        try:
-            with self.conn.cursor() as cur:
-                for chunk, embedding in zip(chunks, embeddings):
-                    cur.execute("""
-                        INSERT INTO rag.document_chunks 
-                            (source_id, content, embedding, chunk_index, chunk_type, metadata, embedding_model)
-                        VALUES (%s, %s, %s::vector, %s, %s, %s, %s)
-                    """, (
-                        source_id,
-                        chunk["content"],
-                        str(embedding),
-                        chunk["chunk_index"],
-                        chunk.get("chunk_type", "text"),
-                        Json(chunk.get("metadata", {})),
-                        embedding_model,
-                    ))
-
-            self.conn.commit()
-            logger.info(f"Inserted {len(chunks)} chunks for source_id={source_id}")
-
-        except psycopg2.Error as e:
-            self.conn.rollback()
-            logger.error(f"Failed to insert chunks for source {source_id}: {e}")
-            raise
-        
-
-    def insert_chunks(self, source_id, chunks, embeddings, embedding_model):
-        """
-        Batch insert chunks using execute_values for high performance.
-        """
-        if len(chunks) != len(embeddings):
-            raise ValueError(f"Mismatch: {len(chunks)} chunks vs {len(embeddings)} embeddings")
-
-        # Prepare the data as a list of tuples
         data_tuples = [
             (
                 source_id,
                 c["content"],
-                str(e),  # embedding vector
+                str(e),
                 c["chunk_index"],
                 c.get("chunk_type", "text"),
                 Json(c.get("metadata", {})),
@@ -185,12 +151,11 @@ class DatabaseManager:
         except psycopg2.Error as e:
             self.conn.rollback()
             logger.error(f"Failed to insert chunks: {e}")
-            raise  
+            raise
 
     def search_similar(self, query_vector, top_k=5, embedding_model=None):
         """
         Find the most similar chunks to a query vector.
-        This is what the copilot API will call.
         
         Args:
             query_vector: list of floats (the embedded question)
@@ -232,6 +197,110 @@ class DatabaseManager:
         except psycopg2.Error as e:
             logger.error(f"Similarity search failed: {e}")
             raise
+
+    def search_with_context(self, query_vector, top_k=5, context_window=1, embedding_model=None):
+        """
+        Find similar chunks AND their neighboring chunks from the same document.
+        
+        This solves the "lost context" problem: if chunk 10 scores 90%,
+        chunks 9 and 11 (from the same source) are also returned because
+        they likely contain related information.
+        
+        Args:
+            query_vector: list of floats (the embedded question)
+            top_k: number of top matching chunks to find
+            context_window: how many neighbors to include on each side (default 1)
+            embedding_model: optional filter
+            
+        Returns:
+            list of dicts, each containing:
+            - The matched chunk info (content, similarity, source, etc.)
+            - 'context_before': list of preceding chunk contents
+            - 'context_after': list of following chunk contents
+            - 'full_context': all chunks merged into one string
+        """
+        # Step 1: Find the top matching chunks (normal vector search)
+        top_chunks = self.search_similar(query_vector, top_k=top_k, embedding_model=embedding_model)
+
+        if not top_chunks or context_window == 0:
+            return top_chunks
+
+        # Step 2: For each match, fetch neighboring chunks from the same source
+        enriched_results = []
+
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                for chunk in top_chunks:
+                    source_file = chunk['source_file']
+                    # Get the chunk_index from metadata
+                    meta = chunk.get('metadata', {})
+                    chunk_index = meta.get('sub_chunk')
+
+                    # We need source_id and chunk_index to find neighbors.
+                    # Query by source file name + content match to get the actual row.
+                    cur.execute("""
+                        SELECT dc.id, dc.source_id, dc.chunk_index, dc.content
+                        FROM rag.document_chunks dc
+                        JOIN rag.source_documents sd ON sd.id = dc.source_id
+                        WHERE sd.file_name = %s
+                          AND dc.content = %s
+                        LIMIT 1
+                    """, (source_file, chunk['content']))
+
+                    match_row = cur.fetchone()
+                    if not match_row:
+                        # Can't find the row, return chunk as-is
+                        chunk['context_before'] = []
+                        chunk['context_after'] = []
+                        chunk['full_context'] = chunk['content']
+                        enriched_results.append(chunk)
+                        continue
+
+                    source_id = match_row['source_id']
+                    matched_index = match_row['chunk_index']
+
+                    # Fetch neighbors: chunks from same source with adjacent indexes
+                    cur.execute("""
+                        SELECT chunk_index, content
+                        FROM rag.document_chunks
+                        WHERE source_id = %s
+                          AND chunk_index BETWEEN %s AND %s
+                        ORDER BY chunk_index
+                    """, (
+                        source_id,
+                        matched_index - context_window,
+                        matched_index + context_window,
+                    ))
+
+                    neighbors = cur.fetchall()
+
+                    context_before = []
+                    context_after = []
+                    for n in neighbors:
+                        if n['chunk_index'] < matched_index:
+                            context_before.append(n['content'])
+                        elif n['chunk_index'] > matched_index:
+                            context_after.append(n['content'])
+
+                    # Build the full merged context
+                    all_parts = context_before + [chunk['content']] + context_after
+                    full_context = "\n---\n".join(all_parts)
+
+                    chunk['context_before'] = context_before
+                    chunk['context_after'] = context_after
+                    chunk['full_context'] = full_context
+                    enriched_results.append(chunk)
+
+        except psycopg2.Error as e:
+            logger.error(f"Context fetch failed: {e}")
+            # Return results without context rather than failing completely
+            for chunk in top_chunks:
+                chunk['context_before'] = []
+                chunk['context_after'] = []
+                chunk['full_context'] = chunk['content']
+            return top_chunks
+
+        return enriched_results
 
     # ─── Management Operations ───
 

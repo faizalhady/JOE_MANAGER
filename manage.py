@@ -46,9 +46,12 @@ def cmd_ingest(path: str):
     """Ingest a file or directory."""
     from ingestion.pipeline import IngestionPipeline
 
+    # Preserve UNC network paths — join remaining args in case of spaces
     target = Path(path)
     if not target.exists():
         print(f"Error: Path not found: {path}")
+        print(f"  Tip: Wrap network paths in quotes:")
+        print(f'  python manage.py ingest "\\\\server\\share\\folder"')
         sys.exit(1)
 
     pipeline = IngestionPipeline()
@@ -85,11 +88,12 @@ def cmd_search(query: str, top_k: int = 5):
     embedder = Embedder()
     embedder.load()
 
-    # Embed the query
-    query_vector = embedder.embed_text(query)
+    # Use embed_query() — applies BGE instruction prefix for better retrieval
+    query_vector = embedder.embed_query(query)
 
     with DatabaseManager() as db:
-        results = db.search_similar(query_vector, top_k=top_k)
+        # context_window=1 means: also fetch 1 chunk before and 1 chunk after each match
+        results = db.search_with_context(query_vector, top_k=top_k, context_window=1)
 
         if not results:
             print("No results found. Is the database empty?")
@@ -100,16 +104,31 @@ def cmd_search(query: str, top_k: int = 5):
 
         for i, r in enumerate(results, 1):
             similarity_pct = r["similarity"] * 100
-            print(f"\n--- Result {i} (similarity: {similarity_pct:.1f}%) ---")
+            has_before = len(r.get('context_before', [])) > 0
+            has_after = len(r.get('context_after', [])) > 0
+            context_label = ""
+            if has_before or has_after:
+                context_label = f" [+{int(has_before)+int(has_after)} neighbor chunks]"
+
+            print(f"\n--- Result {i} (similarity: {similarity_pct:.1f}%){context_label} ---")
             print(f"Source: {r['source_file']} ({r['source_type']})")
             print(f"Type:   {r['chunk_type']}")
             if r.get("metadata"):
                 print(f"Meta:   {r['metadata']}")
-            # Show first 200 chars of content
-            content_preview = r["content"][:200]
-            if len(r["content"]) > 200:
-                content_preview += "..."
-            print(f"Content:\n  {content_preview}")
+            print(f"\nMatched chunk:")
+            print(f"  {r['content']}")
+
+            if r.get('context_before'):
+                print(f"\n  [Context before]:")
+                for ctx in r['context_before']:
+                    preview = ctx[:300] + "..." if len(ctx) > 300 else ctx
+                    print(f"  {preview}")
+
+            if r.get('context_after'):
+                print(f"\n  [Context after]:")
+                for ctx in r['context_after']:
+                    preview = ctx[:300] + "..." if len(ctx) > 300 else ctx
+                    print(f"  {preview}")
 
 
 def cmd_status():
@@ -197,8 +216,12 @@ def main():
     elif command == "ingest":
         if len(sys.argv) < 3:
             print("Usage: python manage.py ingest <file_or_directory>")
+            print('  For paths with spaces: python manage.py ingest "\\\\server\\share\\my folder"')
             sys.exit(1)
-        cmd_ingest(sys.argv[2])
+        # Join all remaining args to handle paths with spaces
+        # e.g. sys.argv = ['manage.py', 'ingest', '\\server\share\my', 'folder']
+        ingest_path = " ".join(sys.argv[2:])
+        cmd_ingest(ingest_path)
     elif command == "search":
         if len(sys.argv) < 3:
             print("Usage: python manage.py search \"your query here\"")

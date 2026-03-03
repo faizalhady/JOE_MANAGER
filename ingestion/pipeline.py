@@ -11,7 +11,7 @@ This is the core engine. It connects all the pieces:
 
 import hashlib
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import List, Optional
 
 from db.connection import DatabaseManager
@@ -78,7 +78,13 @@ class IngestionPipeline:
         if not self._initialized:
             raise RuntimeError("Pipeline not initialized. Call initialize() first.")
 
-        file_path = str(Path(file_path).resolve())
+        # Use absolute path but preserve UNC network paths (\\server\share)
+        p = Path(file_path)
+        if str(file_path).startswith('\\\\') or str(file_path).startswith('//'):
+            # UNC path — don't resolve, it can mangle the \\server prefix
+            file_path = str(p)
+        else:
+            file_path = str(p.resolve())
         file_name = Path(file_path).name
         file_ext = Path(file_path).suffix.lower()
 
@@ -161,6 +167,8 @@ class IngestionPipeline:
             Summary dict with counts of processed, skipped, and failed files.
         """
         dir_path = Path(dir_path)
+        if not dir_path.exists():
+            raise FileNotFoundError(f"Path not found: {dir_path}")
         if not dir_path.is_dir():
             raise NotADirectoryError(f"Not a directory: {dir_path}")
 
