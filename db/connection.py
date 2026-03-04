@@ -65,25 +65,45 @@ class DatabaseManager:
     # ─── Source Document Operations ───
 
     def register_source(self, file_name, file_path, file_type, file_hash, file_size_bytes):
-        """Register a new source document. Returns source_id or None if duplicate."""
+        """
+        Register a new source document. Returns source_id or None if already completed.
+        
+        - If the file hash exists with status='completed' → skip (return None)
+        - If the file hash exists with status='failed' or 'processing' → delete and retry
+        - If new → insert fresh
+        """
         try:
             with self.conn.cursor() as cur:
+                # Check if this file hash already exists
+                cur.execute("""
+                    SELECT id, status FROM rag.source_documents WHERE file_hash = %s
+                """, (file_hash,))
+                existing = cur.fetchone()
+
+                if existing:
+                    existing_id, existing_status = existing
+                    if existing_status == 'completed':
+                        # Already successfully ingested — skip
+                        logger.warning(f"Skipped duplicate: {file_name} (already completed)")
+                        self.conn.commit()
+                        return None
+                    else:
+                        # Failed or stuck in processing — delete and re-ingest
+                        logger.info(f"Re-ingesting {file_name} (previous status: {existing_status})")
+                        cur.execute("DELETE FROM rag.source_documents WHERE id = %s", (existing_id,))
+
+                # Insert fresh record
                 cur.execute("""
                     INSERT INTO rag.source_documents (file_name, file_path, file_type, file_hash, file_size_bytes, status)
                     VALUES (%s, %s, %s, %s, %s, 'processing')
-                    ON CONFLICT (file_hash) DO NOTHING
                     RETURNING id
                 """, (file_name, file_path, file_type, file_hash, file_size_bytes))
 
                 result = cur.fetchone()
                 self.conn.commit()
 
-                if result:
-                    logger.info(f"Registered source: {file_name} (id={result[0]})")
-                    return result[0]
-                else:
-                    logger.warning(f"Skipped duplicate: {file_name} (same content already ingested)")
-                    return None
+                logger.info(f"Registered source: {file_name} (id={result[0]})")
+                return result[0]
 
         except psycopg2.Error as e:
             self.conn.rollback()
