@@ -11,8 +11,8 @@ This is the core engine. It connects all the pieces:
 
 import hashlib
 import logging
-from pathlib import Path, PureWindowsPath
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
 from db.connection import DatabaseManager
 from embeddings.embedder import Embedder
@@ -26,65 +26,81 @@ logger = logging.getLogger(__name__)
 class IngestionPipeline:
     """
     Main pipeline that processes files and stores them as vectors.
-    
+
+    device_override    : 'cuda' | 'cpu' | None
+                         None  → use EMBEDDING_DEVICE from .env (default behaviour)
+                         'cuda' → force GPU  (pass --cuda on CLI)
+                         'cpu'  → force CPU  (pass --cpu  on CLI)
+
+    batch_size_override: int | None
+                         None → use BATCH_SIZE from .env
+                         int  → override batch size for this run
+
+    Each file gets its own fresh DB connection so a dropped connection on one
+    file never cascades to the next.
+
     Usage:
+        # Use .env settings (default)
         pipeline = IngestionPipeline()
-        pipeline.initialize()
-        
-        # Single file
-        pipeline.ingest_file("path/to/document.pdf")
-        
-        # Entire directory
-        pipeline.ingest_directory("path/to/documents/")
-        
-        pipeline.shutdown()
+
+        # Force CUDA for fast local ingestion
+        pipeline = IngestionPipeline(device_override='cuda', batch_size_override=32)
+
+        # Force CPU for server with no GPU
+        pipeline = IngestionPipeline(device_override='cpu', batch_size_override=64)
     """
 
-    def __init__(self):
-        self.db = DatabaseManager()
-        self.embedder = Embedder()
+    def __init__(self, device_override: str = None, batch_size_override: int = None):
+        self.device_override = device_override
+        self.batch_size_override = batch_size_override
+        self.embedder = Embedder(device=device_override)  # None = use config default
         self.chunker = Chunker()
         self._initialized = False
 
     def initialize(self):
-        """Connect to DB, load embedding model, initialize schema."""
+        """Load embedding model and verify DB connectivity."""
         logger.info("Initializing ingestion pipeline...")
 
-        # Connect to database
-        self.db.connect()
+        device_label = self.device_override or "from .env"
+        batch_label = self.batch_size_override or "from .env"
+        logger.info(f"Device: {device_label}  |  Batch size: {batch_label}")
 
-        # Create tables if they don't exist
-        self.db.init_schema()
+        # Verify DB is reachable and schema is ready — short-lived connection
+        with DatabaseManager() as db:
+            db.init_schema()
+        logger.info("Database schema verified.")
 
-        # Load embedding model onto GPU
+        # Load embedding model onto the selected device
         self.embedder.load()
+        logger.info(f"Embedding model ready on: {self.embedder.device}")
 
         self._initialized = True
         logger.info("Pipeline ready.")
 
     def shutdown(self):
         """Clean up resources."""
-        self.db.disconnect()
         self._initialized = False
         logger.info("Pipeline shut down.")
 
     def ingest_file(self, file_path: str) -> Optional[int]:
         """
         Process a single file through the full pipeline.
-        
+        Opens and closes a fresh DB connection per file — prevents
+        'connection already closed' on long batch runs.
+
         Returns:
-            source_id if successful, None if skipped (duplicate)
+            source_id if successful, None if skipped (already completed)
         """
         if not self._initialized:
             raise RuntimeError("Pipeline not initialized. Call initialize() first.")
 
-        # Use absolute path but preserve UNC network paths (\\server\share)
+        # Preserve UNC network paths (\\server\share)
         p = Path(file_path)
         if str(file_path).startswith('\\\\') or str(file_path).startswith('//'):
-            # UNC path — don't resolve, it can mangle the \\server prefix
             file_path = str(p)
         else:
             file_path = str(p.resolve())
+
         file_name = Path(file_path).name
         file_ext = Path(file_path).suffix.lower()
 
@@ -100,69 +116,77 @@ class IngestionPipeline:
         file_type = SUPPORTED_EXTENSIONS[file_ext]
         file_size = Path(file_path).stat().st_size
 
-        # ─── Step 1: Hash the file (detect duplicates) ───
+        # ─── Step 1: Hash (duplicate detection) ───
         file_hash = self._compute_hash(file_path)
         logger.info(f"File hash: {file_hash[:16]}...")
 
-        # ─── Step 2: Register in database ───
-        source_id = self.db.register_source(
-            file_name=file_name,
-            file_path=file_path,
-            file_type=file_type,
-            file_hash=file_hash,
-            file_size_bytes=file_size,
-        )
+        # ─── Steps 2–6: Fresh DB connection per file ───
+        with DatabaseManager() as db:
 
-        if source_id is None:
-            logger.info(f"Skipped: {file_name} (already ingested, same content)")
-            return None
-
-        try:
-            # ─── Step 3: Extract text ───
-            logger.info(f"[1/4] Extracting text from {file_name}...")
-            processor = get_processor(file_path)
-            sections = processor.extract(file_path)
-            logger.info(f"       Extracted {len(sections)} sections")
-
-            if not sections:
-                self.db.update_source_status(source_id, "completed", total_chunks=0)
-                logger.warning(f"No content extracted from {file_name}")
-                return source_id
-
-            # ─── Step 4: Chunk ───
-            logger.info(f"[2/4] Chunking into pieces...")
-            chunks = self.chunker.chunk_sections(sections)
-            logger.info(f"       Created {len(chunks)} chunks")
-
-            # ─── Step 5: Embed ───
-            logger.info(f"[3/4] Embedding {len(chunks)} chunks...")
-            texts = [c["content"] for c in chunks]
-            embeddings = self.embedder.embed_batch(texts)
-            logger.info(f"       Generated {len(embeddings)} vectors")
-
-            # ─── Step 6: Store ───
-            logger.info(f"[4/4] Storing in database...")
-            self.db.insert_chunks(
-                source_id=source_id,
-                chunks=chunks,
-                embeddings=embeddings,
-                embedding_model=self.embedder.get_model_name(),
+            # ─── Step 2: Register ───
+            source_id = db.register_source(
+                file_name=file_name,
+                file_path=file_path,
+                file_type=file_type,
+                file_hash=file_hash,
+                file_size_bytes=file_size,
             )
 
-            # ─── Done ───
-            self.db.update_source_status(source_id, "completed", total_chunks=len(chunks))
-            logger.info(f"SUCCESS: {file_name} → {len(chunks)} chunks stored")
-            return source_id
+            if source_id is None:
+                logger.info(f"Skipped: {file_name} (already completed)")
+                return None
 
-        except Exception as e:
-            logger.error(f"FAILED: {file_name} → {e}")
-            self.db.update_source_status(source_id, "failed", error_message=str(e))
-            raise
+            try:
+                # ─── Step 3: Extract ───
+                logger.info(f"[1/4] Extracting text from {file_name}...")
+                processor = get_processor(file_path)
+                sections = processor.extract(file_path)
+                logger.info(f"       Extracted {len(sections)} sections")
+
+                if not sections:
+                    db.update_source_status(source_id, "completed", total_chunks=0)
+                    logger.warning(f"No content extracted from {file_name}")
+                    return source_id
+
+                # ─── Step 4: Chunk ───
+                logger.info(f"[2/4] Chunking into pieces...")
+                chunks = self.chunker.chunk_sections(sections)
+                logger.info(f"       Created {len(chunks)} chunks")
+
+                # ─── Step 5: Embed ───
+                logger.info(f"[3/4] Embedding {len(chunks)} chunks on {self.embedder.device}...")
+                texts = [c["content"] for c in chunks]
+                embeddings = self.embedder.embed_batch(
+                    texts,
+                    batch_size=self.batch_size_override  # None = use config default
+                )
+                logger.info(f"       Generated {len(embeddings)} vectors")
+
+                # ─── Step 6: Store ───
+                logger.info(f"[4/4] Storing in database...")
+                db.insert_chunks(
+                    source_id=source_id,
+                    chunks=chunks,
+                    embeddings=embeddings,
+                    embedding_model=self.embedder.get_model_name(),
+                )
+
+                db.update_source_status(source_id, "completed", total_chunks=len(chunks))
+                logger.info(f"SUCCESS: {file_name} → {len(chunks)} chunks stored")
+                return source_id
+
+            except Exception as e:
+                logger.error(f"FAILED: {file_name} → {e}")
+                try:
+                    db.update_source_status(source_id, "failed", error_message=str(e))
+                except Exception:
+                    pass
+                raise
 
     def ingest_directory(self, dir_path: str, recursive: bool = True) -> dict:
         """
         Process all supported files in a directory.
-        
+
         Returns:
             Summary dict with counts of processed, skipped, and failed files.
         """
@@ -172,7 +196,6 @@ class IngestionPipeline:
         if not dir_path.is_dir():
             raise NotADirectoryError(f"Not a directory: {dir_path}")
 
-        # Find all supported files
         files = []
         pattern = "**/*" if recursive else "*"
         for ext in SUPPORTED_EXTENSIONS:
@@ -197,9 +220,10 @@ class IngestionPipeline:
                 results["failed"] += 1
                 results["files"].append({"file": file_path.name, "status": "failed", "error": str(e)})
                 logger.error(f"Failed to process {file_path.name}: {e}")
+                # Always continue — one failure never stops the batch
 
         logger.info(f"\nIngestion complete: {results['processed']} processed, "
-                     f"{results['skipped']} skipped, {results['failed']} failed")
+                    f"{results['skipped']} skipped, {results['failed']} failed")
         return results
 
     def _compute_hash(self, file_path: str) -> str:

@@ -2,14 +2,18 @@
 Vector DB Manager - CLI Entry Point
 
 Usage:
-    python manage.py init                    # Initialize database schema
-    python manage.py ingest <file_or_dir>    # Ingest a file or directory
-    python manage.py search "query text"     # Test similarity search
-    python manage.py status                  # Show ingestion summary
-    python manage.py stats                   # Show database statistics
-    python manage.py delete <source_id>      # Delete a source and its chunks
-    python manage.py purge                   # Delete ALL data (careful!)
-    python manage.py config                  # Show current configuration
+    python manage.py init                             # Initialize database schema
+    python manage.py ingest <file_or_dir>             # Ingest using .env device setting
+    python manage.py ingest <file_or_dir> --cuda      # Force CUDA  (local GPU machine)
+    python manage.py ingest <file_or_dir> --cpu       # Force CPU   (server, no GPU)
+    python manage.py ingest <file_or_dir> --cuda --batch-size 16
+    python manage.py ingest <file_or_dir> --cpu  --batch-size 64
+    python manage.py search "query text"              # Test similarity search
+    python manage.py status                           # Show ingestion summary
+    python manage.py stats                            # Show database statistics
+    python manage.py delete <source_id>               # Delete a source and its chunks
+    python manage.py purge                            # Delete ALL data (careful!)
+    python manage.py config                           # Show current configuration
 """
 
 import sys
@@ -42,11 +46,15 @@ def cmd_init():
         print("Extension enabled: pgvector")
 
 
-def cmd_ingest(path: str):
-    """Ingest a file or directory."""
+def cmd_ingest(path: str, device: str = None, batch_size: int = None):
+    """
+    Ingest a file or directory.
+
+    device     : 'cuda' | 'cpu' | None (None = use .env EMBEDDING_DEVICE)
+    batch_size : override BATCH_SIZE from .env
+    """
     from ingestion.pipeline import IngestionPipeline
 
-    # Preserve UNC network paths — join remaining args in case of spaces
     target = Path(path)
     if not target.exists():
         print(f"Error: Path not found: {path}")
@@ -54,7 +62,7 @@ def cmd_ingest(path: str):
         print(f'  python manage.py ingest "\\\\server\\share\\folder"')
         sys.exit(1)
 
-    pipeline = IngestionPipeline()
+    pipeline = IngestionPipeline(device_override=device, batch_size_override=batch_size)
     pipeline.initialize()
 
     try:
@@ -88,11 +96,9 @@ def cmd_search(query: str, top_k: int = 5):
     embedder = Embedder()
     embedder.load()
 
-    # Use embed_query() — applies BGE instruction prefix for better retrieval
     query_vector = embedder.embed_query(query)
 
     with DatabaseManager() as db:
-        # context_window=1 means: also fetch 1 chunk before and 1 chunk after each match
         results = db.search_with_context(query_vector, top_k=top_k, context_window=1)
 
         if not results:
@@ -213,34 +219,64 @@ def main():
 
     if command == "init":
         cmd_init()
+
     elif command == "ingest":
         if len(sys.argv) < 3:
-            print("Usage: python manage.py ingest <file_or_directory>")
-            print('  For paths with spaces: python manage.py ingest "\\\\server\\share\\my folder"')
+            print("Usage: python manage.py ingest <file_or_directory> [--cuda|--cpu] [--batch-size N]")
             sys.exit(1)
-        # Join all remaining args to handle paths with spaces
-        # e.g. sys.argv = ['manage.py', 'ingest', '\\server\share\my', 'folder']
-        ingest_path = " ".join(sys.argv[2:])
-        cmd_ingest(ingest_path)
+
+        # ── Parse flags from the end, path is everything before flags ──
+        raw_args = sys.argv[2:]
+        device = None
+        batch_size = None
+        path_parts = []
+
+        i = 0
+        while i < len(raw_args):
+            arg = raw_args[i]
+            if arg == "--cuda":
+                device = "cuda"
+            elif arg == "--cpu":
+                device = "cpu"
+            elif arg == "--batch-size" and i + 1 < len(raw_args):
+                try:
+                    batch_size = int(raw_args[i + 1])
+                    i += 1  # skip the value token
+                except ValueError:
+                    print(f"Error: --batch-size must be an integer, got '{raw_args[i+1]}'")
+                    sys.exit(1)
+            else:
+                path_parts.append(arg)
+            i += 1
+
+        ingest_path = " ".join(path_parts)
+        cmd_ingest(ingest_path, device=device, batch_size=batch_size)
+
     elif command == "search":
         if len(sys.argv) < 3:
             print("Usage: python manage.py search \"your query here\"")
             sys.exit(1)
         top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 5
         cmd_search(sys.argv[2], top_k)
+
     elif command == "status":
         cmd_status()
+
     elif command == "stats":
         cmd_stats()
+
     elif command == "delete":
         if len(sys.argv) < 3:
             print("Usage: python manage.py delete <source_id>")
             sys.exit(1)
         cmd_delete(int(sys.argv[2]))
+
     elif command == "purge":
         cmd_purge()
+
     elif command == "config":
         cmd_config()
+
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
